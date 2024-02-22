@@ -1,3 +1,6 @@
+#DEMO
+https://amigos-cs2-north-wind.firebaseapp.com/
+
 # AmigosCs2NorthWind
 
 This project was generated with [Angular CLI](https://github.com/angular/angular-cli) version 8.2.2.
