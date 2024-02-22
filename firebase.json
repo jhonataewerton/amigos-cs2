@@ -1,0 +1,10 @@
+{
+  "hosting": {
+    "public": "dist/amigos-cs2-north-wind",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ]
+  }
+}
