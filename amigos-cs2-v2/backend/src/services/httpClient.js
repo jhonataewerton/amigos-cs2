@@ -30,10 +30,27 @@ const client = wrapper(
 // Garante que o UA correto seja anexado a TODA request, sobrescrevendo
 // qualquer default em axios. Resolve a inconsistência da estrutura
 // `defaults.headers` do axios 1.x onde override pós-create não pega.
-client.interceptors.request.use((config) => {
+client.interceptors.request.use(async (config) => {
   config.headers.set('user-agent', currentUserAgent);
+  const cookieHeader = await jar.getCookieString(`${process.env.GAMERSCLUB_BASE_URL}${config.url || ''}`);
+  console.log('[http] → GET', config.url);
+  console.log('[http]   UA:', currentUserAgent.slice(0, 60));
+  console.log('[http]   cookies:', cookieHeader.split('; ').map(c => c.split('=')[0]).join(', '));
+  console.log('[http]   referer:', config.headers.get('referer'));
   return config;
 });
+
+client.interceptors.response.use(
+  (r) => { console.log('[http] ←', r.status, r.config.url); return r; },
+  (e) => {
+    if (e.response) {
+      console.log('[http] ← ERR', e.response.status, e.config?.url);
+      console.log('[http]   cf-mitigated:', e.response.headers['cf-mitigated'] || '(ausente)');
+      console.log('[http]   server:', e.response.headers['server']);
+    }
+    return Promise.reject(e);
+  }
+);
 
 function setUserAgent(ua) {
   if (!ua) return;
