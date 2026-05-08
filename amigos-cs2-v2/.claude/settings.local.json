@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install *)",
+      "Bash(timeout 5 node src/index.js)",
+      "Bash(node src/index.js)",
+      "Bash(curl -s http://localhost:3000/health)",
+      "Bash(curl -s http://localhost:3000/api/lobby/match/26843934/1)",
+      "Bash(kill %1)",
+      "Bash(node -e \"const { CookieJar } = require\\('tough-cookie'\\); const { wrapper } = require\\('axios-cookiejar-support'\\); console.log\\('OK'\\)\")",
+      "Bash(node -e \"require\\('puppeteer-extra'\\); require\\('puppeteer-extra-plugin-stealth'\\); console.log\\('OK'\\)\")",
+      "Bash(node -e ' *)",
+      "Bash(sudo apt-get install -y libnspr4 libnss3 libdbus-1-3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 libpango-1.0-0 libpangocairo-1.0-0 libx11-xcb1 libxcb-dri3-0)",
+      "Read(//usr/bin/**)",
+      "Read(//snap/**)",
+      "Bash(cat /etc/os-release | grep -E \"^\\(NAME|VERSION\\)\" 2>/dev/null)",
+      "Read(//usr/lib/**)",
+      "Bash(npm list *)",
+      "Bash(npm --version)",
+      "Bash(node -e \"require\\('./index.js'\\)\")",
+      "Bash(firebase projects:list)",
+      "Bash(dir \"c:\\\\Users\\\\Jhonata Ewerton\\\\Desktop\\\\amigos-cs2\\\\backend\\\\src\\\\services\" /b)"
+    ]
+  }
+}
