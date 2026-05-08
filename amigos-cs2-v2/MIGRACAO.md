@@ -88,18 +88,26 @@ Login automatizado por email/senha foi removido — o GamersClub não aceita mai
 
 **Versão Node no VPS:** Node 18.19.1 (Ubuntu 24.04 default). O `package.json` declara `engines: { node: "22" }` mas funciona em 18 com os deps downgradados. Upgrade pra Node 22 é opcional — se for feito, dá pra reverter os deps pras versões 6.
 
-### Fase 5 — Domínio + HTTPS
+### Fase 5 — Domínio + HTTPS ✅ (2026-05-08)
 
-Sem domínio, o frontend (HTTPS no Firebase Hosting) não consegue chamar o backend (mixed content), e Let's Encrypt não emite cert pra IP.
+- Subdomínio: **`amigos-cs2.duckdns.org`** (gratuito, IP da Vultr SP)
+- Reverse proxy: Nginx em `/etc/nginx/sites-available/amigos-cs2`
+- Cert TLS: válido até **2026-08-06**, renovação automática via `certbot.timer`
+- Redirect HTTP→HTTPS via 301
 
-Opções:
-- **DuckDNS** (grátis): `<nome>.duckdns.org` aponta pro IP da VPS, Let's Encrypt funciona
-- Domínio próprio (~R$5-15/ano em Namecheap/Porkbun): `.click`, `.xyz`, etc.
+**Provedor de cert e método (não foi pelo Let's Encrypt):**
+- Let's Encrypt estava em manutenção (HTTP 503) durante toda a sessão
+- ZeroSSL HTTP-01 ficou travado em "processing" (provável bug deles, `Retry-After: 86400`)
+- **Solução final: ZeroSSL via DNS-01** + plugin `certbot-dns-duckdns`
+  - Plugin instalado: `pip3 install certbot-dns-duckdns --break-system-packages`
+  - Credenciais DuckDNS em `/root/.duckdns-credentials` (modo 600)
+  - Renewal config salvo em `/etc/letsencrypt/renewal/amigos-cs2.duckdns.org.conf`
 
-Setup geral:
-- Apontar `api.<dominio>` (registro A) → IP da VPS
-- Nginx reverse proxy → `127.0.0.1:3000`
-- Certbot Let's Encrypt
+Quando renovar manualmente (caso a renovação automática falhe):
+```bash
+certbot renew
+```
+Vai usar a mesma config (DNS-01 via DuckDNS).
 
 ### Fase 6 — Cutover
 - Atualizar base URL no frontend

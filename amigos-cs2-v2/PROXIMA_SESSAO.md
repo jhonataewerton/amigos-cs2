@@ -1,116 +1,109 @@
-# Próxima sessão — Retomar Fase 5 (HTTPS)
+# Próxima sessão — Fase 6 (cutover do frontend)
 
-> Status em **2026-05-08 ~19:50** — Let's Encrypt fora do ar pra manutenção, parado no **Passo 6** (rodar Certbot). Quando o serviço voltar, retomar daqui.
+> Status em **2026-05-08 ~20:45** — Fase 5 ✅ completa (HTTPS rodando em `https://amigos-cs2.duckdns.org`). Próxima sessão: ajustar o frontend e desativar a Cloud Function.
 
 ---
 
 ## TL;DR
 
 ```bash
-# 1. checar se Let's Encrypt voltou
-curl -sI https://acme-v02.api.letsencrypt.org/directory | head -1
-# se vier "HTTP/2 200" pode prosseguir
-
-# 2. rodar Certbot (passo 6)
-ssh root@<IP_DA_VPS>
-certbot --nginx -d amigos-cs2.duckdns.org --redirect --agree-tos --no-eff-email -m jhonata.as@hotmail.com
-
-# 3. testar HTTPS (passo 7)
-curl -i https://amigos-cs2.duckdns.org/health
-curl -i http://amigos-cs2.duckdns.org/health   # tem que dar 301/308 redirect
+# verificação rápida pra confirmar que o backend ainda tá saudável
+curl -sI https://amigos-cs2.duckdns.org/health
+curl -s https://amigos-cs2.duckdns.org/api/lobby/match/26866303/1 | head -c 100
 ```
 
-Se os dois `curl` derem certo → Fase 5 ✅, partir pra Fase 6 (frontend + cutover).
+Se os dois funcionarem, partir pra ajuste do frontend (passos 8-10 abaixo).
 
 ---
 
 ## O que já está feito ✅
 
-### Fase 1-3: VPS + backend deployado
-- VPS Vultr SP, Ubuntu 24.04, $6/mês — provisionada
-- Docker + FlareSolverr (Docker, bind 127.0.0.1:8191)
-- Node 18 + PM2 — `pm2 status` mostra `amigos-cs2` online
-- Backend rodando em `127.0.0.1:3000`, autenticando via cookies do `.env` + cf_clearance do FlareSolverr
+### Fase 1-4 ✅ — VPS + backend funcionando
+Detalhes em [`MIGRACAO.md`](./MIGRACAO.md).
 
-### Fase 4: validação ✅
-- `curl localhost:3000/health` → `authenticated: true`
-- `curl localhost:3000/api/lobby/match/26866303/1` → JSON correto
-- 5 bugs encontrados e corrigidos (ver tabela em [`MIGRACAO.md`](./MIGRACAO.md))
+### Fase 5 ✅ — Domínio + HTTPS (concluída em 2026-05-08)
+- DuckDNS: `amigos-cs2.duckdns.org` → IP da VPS
+- Nginx reverse proxy configurado em `/etc/nginx/sites-available/amigos-cs2`
+- Cert TLS válido até **2026-08-06** (renovação automática)
+- Redirect HTTP→HTTPS via 301
 
-### Fase 5: parcial — HTTP funcionando, HTTPS pendente
-- DuckDNS configurado: `amigos-cs2.duckdns.org` → IP da VPS ✅
-- Nginx instalado e configurado como reverse proxy ✅
-  - Config em `/etc/nginx/sites-available/amigos-cs2`
-  - `proxy_pass http://127.0.0.1:3000`
-- `curl http://amigos-cs2.duckdns.org/health` → `200 OK` com JSON ✅
-- **Certbot/Let's Encrypt — falhou** com erro "service is down for maintenance"
+**Detalhes não-óbvios da emissão do cert:**
+- Let's Encrypt estava em manutenção (503) durante a sessão → tivemos que ir pra ZeroSSL
+- ZeroSSL HTTP-01 ficou travado em "processing" → tivemos que ir pra DNS-01
+- DNS-01 funcionou via plugin `certbot-dns-duckdns` (instalado com `pip3 install certbot-dns-duckdns --break-system-packages`)
+- Credenciais DuckDNS guardadas em `/root/.duckdns-credentials` (modo 600)
+- Configuração de renewal salva pelo certbot em `/etc/letsencrypt/renewal/amigos-cs2.duckdns.org.conf` — vai usar o mesmo método (DNS-01 + ZeroSSL) pra renovar
 
 ---
 
-## O que falta
+## Fase 6 — Cutover (próximos passos)
 
-### Passo 6 — Certbot (HTTPS) ⏸ aguardando Let's Encrypt voltar
+### Passo 8 — Ajustar URL da API no frontend
 
+O frontend Angular hoje aponta pra Cloud Function (`us-central1`). Precisa apontar pra `https://amigos-cs2.duckdns.org/api`.
+
+Provável arquivo: `environments/environment.prod.ts` (e talvez `environment.ts` pra dev). Procurar a constante de base URL — algo tipo `apiBaseUrl`, `gcProxyUrl`, ou similar.
+
+**O frontend Angular não está nesse working directory** — precisa abrir o repo do frontend.
+
+Comando útil pra encontrar:
 ```bash
-certbot --nginx -d amigos-cs2.duckdns.org --redirect --agree-tos --no-eff-email -m jhonata.as@hotmail.com
+# no repo do frontend
+grep -r "cloudfunctions.net\|us-central1\|firebase" src/
 ```
 
-Esse comando:
-- Pega cert do Let's Encrypt
-- Edita `/etc/nginx/sites-available/amigos-cs2` automaticamente pra adicionar `:443 ssl`
-- Adiciona redirect HTTP→HTTPS (`--redirect`)
-- Recarrega o nginx
-
-Renovação automática já vem ativa via `certbot.timer` no Ubuntu 24.
-
-**Plano B se Let's Encrypt seguir fora**: usar **ZeroSSL** como ACME alternativo. Detalhes na conversa anterior, mas requer signup em `app.zerossl.com/developer` pra pegar EAB credentials.
-
-### Passo 7 — Validar HTTPS
-
+Substituir a base URL e fazer build + deploy:
 ```bash
-# tem que voltar HTTP/2 200 com JSON
-curl -i https://amigos-cs2.duckdns.org/health
-
-# tem que voltar 301 ou 308 (redirect)
-curl -i http://amigos-cs2.duckdns.org/health
-
-# fim a fim
-curl -s https://amigos-cs2.duckdns.org/api/lobby/match/26866303/1 | head -c 300
+ng build --configuration production
+firebase deploy --only hosting
 ```
 
-### Passo 8 — Ajustar frontend (Fase 6)
+### Passo 9 — Smoke test no browser
 
-Trocar a base URL da API no Angular. Hoje aponta pra Cloud Function (us-central1); precisa apontar pra `https://amigos-cs2.duckdns.org/api`.
+Abre `https://amigos-cs2-north-wind.web.app` no Chrome:
+1. F12 → Network
+2. Navega numa partida ou tela que use a API
+3. Verifica que as chamadas vão pra `amigos-cs2.duckdns.org` e retornam 200
 
-Provável arquivo: `environments/environment.prod.ts` (ou similar). Verificar repo do frontend (não está nesse working directory).
+Se aparecer **CORS error**, o backend tem `ALLOWED_ORIGIN=https://amigos-cs2-north-wind.web.app` no `.env` da VPS — confere se bate. Se o frontend for migrado pra outro domínio (ex: domínio próprio mais tarde), precisa atualizar `ALLOWED_ORIGIN` e `pm2 restart amigos-cs2`.
 
-Build + deploy do frontend (`firebase deploy --only hosting`).
+### Passo 10 — Desativar a Cloud Function (24h+ depois do cutover)
 
-### Passo 9 — Smoke test completo
-
-Abrir `https://amigos-cs2-north-wind.web.app` no browser, abrir DevTools → Network, navegar pra uma partida. As chamadas devem ir pra `amigos-cs2.duckdns.org` e retornar 200.
-
-### Passo 10 — Desativar Cloud Function
-
-Só depois que o frontend estiver 100% usando a VPS por pelo menos 24h (margem pra rollback se der ruim).
+Só depois que o frontend estiver 100% usando a VPS por pelo menos um dia inteiro (margem pra rollback se algo der ruim em prod).
 
 ```bash
-firebase functions:delete <nome-da-function> --region us-central1
+# lista as functions ativas
+firebase functions:list
+
+# deleta a function do proxy (substituir <nome> pelo que aparecer no list)
+firebase functions:delete <nome> --region us-central1
 ```
 
-E remover `firebase-admin` + `firebase-functions` do `package.json` do backend (não são mais usados).
+Depois, no `package.json` do backend, remover deps não usadas:
+```bash
+cd ~/amigos-cs2/amigos-cs2-v2/backend  # ou local
+npm uninstall firebase-admin firebase-functions
+```
+
+Remover scripts de Firebase do `package.json`:
+```json
+// remover:
+"serve": "firebase emulators:start --only functions",
+"deploy": "firebase deploy --only functions"
+```
 
 ---
 
 ## Pendências secundárias (low prio, dá pra deixar pra depois)
 
-- **UFW** — firewall não está ativo. Configurar:
+Mantidas da sessão anterior:
+
+- **UFW firewall** — não está ativo. Configurar:
   ```bash
   ufw default deny incoming
   ufw allow 22 && ufw allow 80 && ufw allow 443
   ufw enable
   ```
-  (porta 8191 fica fechada, pois FlareSolverr está em 127.0.0.1)
 
 - **PM2 startup** — pra app subir sozinho se a VPS reiniciar:
   ```bash
@@ -120,7 +113,9 @@ E remover `firebase-admin` + `firebase-functions` do `package.json` do backend (
 
 - **Usuário não-root** — hoje tudo roda como root no VPS. Criar usuário `deploy`, mover o app pra ele, desabilitar root SSH.
 
-- **Upgrade Node 18 → 22** — opcional. Se for feito, dá pra reverter `tough-cookie` e `axios-cookiejar-support` pras versões 6 (mais novas).
+- **Upgrade Node 18 → 22** — opcional. Se for feito, dá pra reverter `tough-cookie` e `axios-cookiejar-support` pras versões 6.
+
+- **DuckDNS auto-update IP** — desnecessário hoje (Vultr tem IP fixo), mas se um dia migrar pra um host com IP dinâmico, precisa rodar um cron que bate em `https://www.duckdns.org/update?domains=amigos-cs2&token=<TOKEN>` periodicamente.
 
 ---
 
@@ -129,18 +124,21 @@ E remover `firebase-admin` + `firebase-functions` do `package.json` do backend (
 1. **Logs do app**: `pm2 logs amigos-cs2 --lines 50 --nostream`
 2. **Logs do FlareSolverr**: `docker logs -f flaresolverr`
 3. **Logs do Nginx**: `tail -f /var/log/nginx/error.log`
-4. **Status Let's Encrypt**: https://letsencrypt.status.io/
+4. **Status do cert**: `certbot certificates`
 5. **Tabela de troubleshooting**: [`DOCUMENTACAO.md`](./DOCUMENTACAO.md), seção 4.3
-6. **Histórico de bugs já vistos**: [`MIGRACAO.md`](./MIGRACAO.md)
+6. **Histórico de bugs**: [`MIGRACAO.md`](./MIGRACAO.md)
 
 ---
 
-## Comando único pra testar tudo (depois do certbot rodar)
+## Healthcheck rápido
 
 ```bash
 echo "== HTTPS health ==" && curl -sI https://amigos-cs2.duckdns.org/health | head -3 && \
 echo "== HTTP redirect ==" && curl -sI http://amigos-cs2.duckdns.org/health | head -3 && \
-echo "== JSON =="          && curl -s https://amigos-cs2.duckdns.org/api/lobby/match/26866303/1 | head -c 200 && echo
+echo "== JSON =="          && curl -s https://amigos-cs2.duckdns.org/api/lobby/match/26866303/1 | head -c 100 && echo
 ```
 
-Se os 3 blocos vierem ok → HTTPS funcionando, Fase 5 ✅.
+Esperado:
+- HTTPS health: `HTTP/2 200`
+- HTTP redirect: `HTTP/1.1 301`
+- JSON: `{"success":true,"message":null,"id":"26866303",...`

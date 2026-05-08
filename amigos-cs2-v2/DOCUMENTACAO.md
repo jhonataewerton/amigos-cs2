@@ -111,19 +111,28 @@ pm2 startup && pm2 save      # auto-start no boot da VPS
 
 **Config:** `/etc/nginx/sites-available/amigos-cs2` — server block que escuta `:443 ssl` e faz `proxy_pass http://127.0.0.1:3000;`.
 
-### 1.6 Certbot + Let's Encrypt
+### 1.6 Certbot + ZeroSSL (DNS-01 via DuckDNS)
 
-**O que é:** Certbot é o cliente; Let's Encrypt é a CA (Certificate Authority) que emite certificados TLS gratuitos.
+**O que é:** Certbot é o cliente; ZeroSSL é a CA (Certificate Authority) que emite o certificado TLS. Originalmente o plano era usar Let's Encrypt, mas LE estava em manutenção quando emitimos, e ZeroSSL HTTP-01 estava bugado — fechamos com **ZeroSSL via desafio DNS-01**.
 
-**Por que:** o frontend é HTTPS, então o backend tem que ser HTTPS também (browsers bloqueiam mixed content). Let's Encrypt é grátis e confiável.
+**Por que HTTPS:** o frontend é HTTPS (Firebase Hosting), então o backend tem que ser HTTPS também (browsers bloqueiam mixed content).
 
-**Renovação:** automática via `systemd timer` (`certbot.timer`). Cert dura 90 dias, renova quando faltam 30.
+**Por que DNS-01 e não HTTP-01:** ZeroSSL não conseguia validar HTTP-01 (challenge ficava em "processing" infinitamente). DNS-01 cria um TXT record em `_acme-challenge.amigos-cs2.duckdns.org` via API do DuckDNS, ZeroSSL consulta esse DNS pra validar.
+
+**Plugin necessário:** `certbot-dns-duckdns` (instalado com `pip3 install certbot-dns-duckdns --break-system-packages`).
+
+**Credenciais:** `/root/.duckdns-credentials` (modo 600), uma linha: `dns_duckdns_token = <token>`.
+
+**Renovação:** automática via `systemd timer` (`certbot.timer`). Cert dura 90 dias, renova quando faltam 30. A config de renewal em `/etc/letsencrypt/renewal/amigos-cs2.duckdns.org.conf` já guarda que tem que usar ZeroSSL+DNS-01.
 
 **Confere com:**
 ```bash
 systemctl list-timers | grep certbot
 certbot certificates
+certbot renew --dry-run    # simulação completa de renovação (recomendado rodar uma vez)
 ```
+
+**Se ZeroSSL um dia também der pau** e Let's Encrypt já estiver de volta, basta editar o renewal config (`/etc/letsencrypt/renewal/amigos-cs2.duckdns.org.conf`) e remover as linhas `server = https://acme.zerossl.com/...`, `eab_kid`, `eab_hmac_key`. Aí roda `certbot renew --force-renewal` que migra pra LE.
 
 ### 1.7 DuckDNS
 
