@@ -9,12 +9,15 @@ async function persistCfClearance(cookies = []) {
   const cf = cookies.find((c) => c.name === 'cf_clearance');
   if (!cf) throw new Error('FlareSolverr não retornou cf_clearance');
 
+  // FlareSolverr devolve domain ".gamersclub.com.br" (com ponto), mas com
+  // hostOnly:true o tough-cookie só matcha host literal — então usamos o
+  // hostname puro pra alinhar com os outros cookies do jar.
   const tc = new Cookie({
     key: 'cf_clearance',
     value: cf.value,
-    domain: cf.domain || new URL(GC_URL()).hostname,
-    path: cf.path || '/',
-    secure: cf.secure !== false,
+    domain: new URL(GC_URL()).hostname,
+    path: '/',
+    secure: true,
     hostOnly: true,
   });
   await jar.setCookie(tc, GC_URL());
