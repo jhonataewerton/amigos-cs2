@@ -174,15 +174,15 @@ export class AppComponent {
       };
     });
 
-    const users = [292823, 492702, 211335, 364266, 742567, 564387, 435993, 1717062, 506013, 1225732, 521452]
+    const users = [699990,292823, 492702, 211335, 364266, 742567, 564387, 435993, 1717062, 506013, 1225732, 521452]
     const totalFiltered = this.total.filter(obj => users.includes(obj.user))
 
     this.onlyFriends ?  this.dataSource = totalFiltered : this.dataSource = this.total;
   }
 
-  
+
   showOnlyGroupTeam() {
-    const users = [292823, 492702, 211335, 364266, 742567, 564387, 435993, 1717062, 506013, 1225732, 521452]
+    const users = [699990,292823, 492702, 211335, 364266, 742567, 564387, 435993, 1717062, 506013, 1225732, 521452]
     const totalFiltered = this.total.filter(obj => users.includes(obj.user))
     this.onlyFriends ?  this.dataSource = this.total  : this.dataSource = totalFiltered
   }
@@ -190,7 +190,7 @@ export class AppComponent {
 
 
   sortData(sort: Sort) {
-    const users = [292823, 492702, 211335, 364266, 742567, 564387, 435993, 1717062, 506013, 1225732, 521452]
+    const users = [699990,292823, 492702, 211335, 364266, 742567, 564387, 435993, 1717062, 506013, 1225732, 521452]
     const totalFiltered = this.total.filter(obj => users.includes(obj.user))
     const data = this.onlyFriends ? totalFiltered.slice() : this.dataSource.slice()
     if (!sort.active || sort.direction === '') {

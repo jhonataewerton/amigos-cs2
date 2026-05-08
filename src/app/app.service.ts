@@ -6,7 +6,7 @@ import { Observable } from "rxjs";
   providedIn: "root",
 })
 export class AppService {
-  baseUrl = "https://gamersclub.com.br/lobby/match/";
+  baseUrl = "https://amigos-cs2.duckdns.org/api/lobby/match/";
 
   constructor(private http: HttpClient) {}
 
@@ -14,7 +14,7 @@ export class AppService {
     const headers = new HttpHeaders({
       accept: "application/json, text/plain, */*",
       "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-      referer: "https://gamersclub.com.br/lobby/match/23881069",
+      referer: "https://amigos-cs2.duckdns.org/api/lobby/match/23881069",
       "user-agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
       priority: "u=1, i",
