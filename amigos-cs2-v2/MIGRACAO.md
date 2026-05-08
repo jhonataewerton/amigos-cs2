@@ -72,11 +72,31 @@ Login automatizado por email/senha foi removido — o GamersClub não aceita mai
 - **Editar na VPS:** setar `FLARESOLVERR_URL=http://localhost:8191/v1`
 - `pm2 start src/index.js --name amigos-cs2`
 
-### Fase 4 — Validação
-- `curl http://localhost:3000/health` → `{ status: "ok", session: { authenticated: true, mode: "manual+flaresolverr" } }`
-- `curl http://localhost:3000/api/lobby/match/26866303/1` → JSON
+### Fase 4 — Validação ✅ (2026-05-08)
+- `curl http://localhost:3000/health` → `{ status: "ok", session: { authenticated: true, mode: "manual+flaresolverr" } }` ✅
+- `curl http://localhost:3000/api/lobby/match/26866303/1` → JSON ✅
+
+**Bugs encontrados e corrigidos durante a Fase 4:**
+
+| Bug | Sintoma | Causa | Fix |
+|---|---|---|---|
+| ESM-only deps | `ERR_REQUIRE_ESM` no boot | `tough-cookie@6` e `axios-cookiejar-support@6` viraram ESM. Node 18 (no VPS) não suporta `require(esm)` | Downgrade pra `tough-cookie@^4.1.4` e `axios-cookiejar-support@^5.0.5` |
+| `localhost` → IPv6 | `connect ECONNREFUSED ::1:8191` | Node 18 resolve `localhost` pra `::1` (IPv6), FlareSolverr bind só em `127.0.0.1` | `.env`: `FLARESOLVERR_URL=http://127.0.0.1:8191/v1` |
+| `/v1` duplicado | 404 do FlareSolverr | Código fazia `axios.post(\`${solver}/v1\`, ...)` enquanto `.env` já incluía `/v1` | `flaresolverr.js`: `axios.post(solver, ...)` (sem suffix) |
+| `cf_clearance` não saía nas requests | 403 mesmo com sessão "ok" | Solver retorna `domain: ".gamersclub.com.br"` (com ponto). Combinado com `hostOnly:true` no `tough-cookie@4`, o cookie ficava armazenado mas não matchava no envio | `flaresolverr.js`: `domain: new URL(GC_URL()).hostname` (hostname puro, sem ponto) |
+| `setUserAgent` sem efeito | UA padrão (Windows Chrome) saía nas requests, mismatch com cf_clearance (Linux Chrome) | Override de `client.defaults.headers['user-agent']` em axios 1.x não pega de forma confiável | `httpClient.js`: variável `currentUserAgent` + request interceptor que sobrescreve o header em toda request |
+
+**Versão Node no VPS:** Node 18.19.1 (Ubuntu 24.04 default). O `package.json` declara `engines: { node: "22" }` mas funciona em 18 com os deps downgradados. Upgrade pra Node 22 é opcional — se for feito, dá pra reverter os deps pras versões 6.
 
 ### Fase 5 — Domínio + HTTPS
+
+Sem domínio, o frontend (HTTPS no Firebase Hosting) não consegue chamar o backend (mixed content), e Let's Encrypt não emite cert pra IP.
+
+Opções:
+- **DuckDNS** (grátis): `<nome>.duckdns.org` aponta pro IP da VPS, Let's Encrypt funciona
+- Domínio próprio (~R$5-15/ano em Namecheap/Porkbun): `.click`, `.xyz`, etc.
+
+Setup geral:
 - Apontar `api.<dominio>` (registro A) → IP da VPS
 - Nginx reverse proxy → `127.0.0.1:3000`
 - Certbot Let's Encrypt
