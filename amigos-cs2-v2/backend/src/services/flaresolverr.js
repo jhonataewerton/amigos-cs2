@@ -25,7 +25,7 @@ async function callSolver(url) {
   if (!solver) throw new Error('FLARESOLVERR_URL não configurado');
 
   const body = { cmd: 'request.get', url, maxTimeout: 60000 };
-  const resp = await axios.post(`${solver}/v1`, body, { timeout: 120000 });
+  const resp = await axios.post(solver, body, { timeout: 120000 });
   if (resp.data?.status !== 'ok') {
     throw new Error(`FlareSolverr retornou status="${resp.data?.status}" — ${resp.data?.message || 'sem detalhes'}`);
   }
