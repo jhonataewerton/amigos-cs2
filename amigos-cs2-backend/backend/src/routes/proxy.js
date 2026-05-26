@@ -51,7 +51,7 @@ router.get('/lobby/match/:matchId', (req, res) => {
 
 function handleProxyError(error, res, url) {
   if (error.response) {
-    const { status } = error.response;
+    const { status, data } = error.response;
     const messages = {
       401: 'Não autenticado no Gamersclub — sessão expirada',
       403: 'Acesso bloqueado — Cloudflare ou permissão negada',
@@ -60,6 +60,12 @@ function handleProxyError(error, res, url) {
     };
     const message = messages[status] || `Erro ${status} do Gamersclub`;
     console.error(`[proxy] ${status} em ${url}: ${message}`);
+    if (status >= 500) {
+      const preview = typeof data === 'string'
+        ? data.slice(0, 400)
+        : JSON.stringify(data).slice(0, 400);
+      console.error(`[proxy] body do ${status} em ${url}: ${preview}`);
+    }
     return res.status(status).json({ error: message, status });
   }
 
