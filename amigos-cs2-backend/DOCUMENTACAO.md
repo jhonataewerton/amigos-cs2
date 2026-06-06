@@ -1,411 +1,392 @@
 # Documentação — Backend amigos-cs2 (proxy GamersClub)
 
-> **Para um histórico narrativo da migração** (Firebase Functions → VPS), bugs encontrados e decisões de arquitetura, ver [`MIGRACAO.md`](./MIGRACAO.md).
->
-> Este documento é a referência **operacional**: o que tem rodando, por que cada peça existe, e como manter tudo funcionando.
+Referência única do backend: o que é, como funciona, quais bibliotecas usa, como
+a VPS está montada e como operar no dia a dia.
+
+> Para **rotacionar os tokens de sessão** (quando o backend começa a falhar com
+> "sessão inválida"), veja [`RENOVAR-TOKENS.md`](./RENOVAR-TOKENS.md).
 
 ---
 
 ## Sumário
 
 1. [Visão geral](#1-visão-geral)
-2. [Camada 1 — Infraestrutura (VPS)](#camada-1--infraestrutura-vps)
-3. [Camada 2 — Aplicação Node.js](#camada-2--aplicação-nodejs)
-4. [Camada 3 — Bibliotecas (o que e por quê)](#camada-3--bibliotecas-o-que-e-por-quê)
-5. [Camada 4 — Rotacionar tokens / cookies](#camada-4--rotacionar-tokens--cookies)
-6. [Operação no dia a dia](#operação-no-dia-a-dia)
+2. [Como funciona uma requisição](#2-como-funciona-uma-requisição)
+3. [Cache, serialização e deduplicação](#3-cache-serialização-e-deduplicação)
+4. [Infraestrutura (VPS)](#4-infraestrutura-vps)
+5. [Aplicação Node.js](#5-aplicação-nodejs)
+6. [Bibliotecas (o que e por quê)](#6-bibliotecas-o-que-e-por-quê)
+7. [Variáveis de ambiente (.env)](#7-variáveis-de-ambiente-env)
+8. [Endpoints](#8-endpoints)
+9. [Operação no dia a dia](#9-operação-no-dia-a-dia)
+10. [Troubleshooting](#10-troubleshooting)
+11. [Pendências](#11-pendências)
 
 ---
 
 ## 1. Visão geral
 
-O sistema é um **proxy autenticado** entre o frontend (`https://amigos-cs2-north-wind.web.app`) e a API privada do GamersClub. O frontend chama o proxy; o proxy injeta cookies de uma sessão autenticada do GC e devolve a resposta.
+O sistema é um **proxy autenticado** entre o frontend (Angular, no Firebase
+Hosting) e a API privada do GamersClub (GC). O frontend não pode chamar o GC
+direto por dois motivos: **CORS** (o browser bloqueia cross-origin) e
+**Cloudflare + autenticação** (o GC exige cookies de sessão e um `cf_clearance`
+válido). O backend resolve os dois: injeta a sessão autenticada e devolve o JSON
+pro frontend.
 
 ```
-[Frontend HTTPS]
+[Frontend Angular]  https://amigos-cs2-north-wind.web.app  (Firebase Hosting)
+       │
+       ▼  https://amigos-cs2.duckdns.org/api/lobby/match/...
+[DuckDNS] amigos-cs2.duckdns.org → IP fixo da VPS
        │
        ▼
-[DuckDNS DNS] amigos-cs2.duckdns.org → IP da VPS
+[VPS Vultr — São Paulo, Ubuntu 24.04]
        │
-       ▼
-[VPS Vultr SP — Ubuntu 24.04]
+       ├── Nginx :443 (HTTPS, TLS) ── proxy_pass → 127.0.0.1:3000
        │
-       ├── Nginx :443 (HTTPS, Let's Encrypt)
-       │     └─ proxy_pass → 127.0.0.1:3000
-       │
-       ├── Express :3000 (gerenciado por PM2)
-       │     ├─ injeta gclubsess + accessToken (cookies do .env)
-       │     ├─ usa cf_clearance + UA do FlareSolverr
-       │     └─ cron a cada 25 min renova cf_clearance
+       ├── Express :3000 (PM2)
+       │     ├─ cache em memória das partidas já buscadas
+       │     └─ busca a API do GC pelo FlareSolverr (ver abaixo)
        │
        └── FlareSolverr (Docker, 127.0.0.1:8191)
-             └─ resolve Cloudflare challenge a partir do IP da VPS
+             └─ Chrome headless: resolve Cloudflare + faz a request com
+                fingerprint de browser real
                        │
                        ▼
                 gamersclub.com.br
 ```
 
+**Por que a busca passa pelo FlareSolverr (e não pelo axios direto):**
+o GamersClub fica atrás do Cloudflare, que valida não só o `cf_clearance` mas
+também o **fingerprint TLS (JA3)** de quem faz a chamada. Uma requisição feita
+pelo axios/Node tem fingerprint de "não-browser" — o Cloudflare deixa passar pro
+servidor do GC, mas o GC responde **500** (uma página de erro HTML com New
+Relic). Já o **FlareSolverr usa um Chrome real**: fingerprint de browser +
+`cf_clearance` consistente → o GC responde **200 + JSON**. Por isso, em produção,
+**toda** chamada à API do GC sai pelo FlareSolverr, com os cookies de sessão
+injetados.
+
 **Stack rápida:**
-- VPS: Vultr Cloud Compute, São Paulo, Ubuntu 24.04, $6/mês
-- Backend: Node.js 18 + Express + axios + tough-cookie
-- Anti-Cloudflare: FlareSolverr (Docker)
-- Reverse proxy: Nginx
-- TLS: Let's Encrypt via Certbot
-- DNS: DuckDNS (subdomínio gratuito)
+- VPS: Vultr Cloud Compute, São Paulo, Ubuntu 24.04 (~$6/mês), IP fixo
+- Backend: Node.js 18 + Express 5 + axios
+- Anti-Cloudflare / fetch: FlareSolverr (Chrome headless em Docker)
+- Reverse proxy / TLS: Nginx + Certbot (ZeroSSL via DNS-01)
+- DNS: DuckDNS
 - Process manager: PM2
 
 ---
 
-## Camada 1 — Infraestrutura (VPS)
+## 2. Como funciona uma requisição
 
-### 1.1 Vultr Cloud Compute
+1. O frontend chama `https://amigos-cs2.duckdns.org/api/lobby/match/27128374/1`.
+2. O Nginx termina o TLS e repassa pra `http://127.0.0.1:3000/...`.
+3. O Express cai no router `routes/proxy.js`.
+4. **Cache:** se essa partida/aba já foi buscada e o cache ainda está fresco, a
+   resposta sai daí na hora, sem tocar no GC (header `x-proxy-cache: HIT`).
+5. Senão, o proxy chama `flaresolverr.fetchJson(url)`:
+   - Monta o POST pro FlareSolverr (`cmd: request.get`) com os **cookies de
+     sessão** do `.env` (`gclubsess`, `gcid:accessToken`, `x-gcid:accessToken`).
+   - O FlareSolverr abre o Chrome, resolve o Cloudflare e busca a URL.
+   - O Chrome renderiza o JSON dentro de um `<pre>` (com entidades HTML
+     escapadas); `extractJson()` extrai e faz o parse.
+6. O proxy guarda a resposta no cache e devolve o JSON pro frontend
+   (`x-proxy-cache: MISS`).
 
-**O que é:** servidor virtual (VPS) com IP fixo. Plano $6/mês, região São Paulo, Ubuntu 24.04.
-
-**Por que aqui:** a Cloud Function do Firebase (us-central1) levava 403 do Cloudflare por causa do IP do GCP estar em listas de bots. Uma VPS residencial-ish brasileira passa sem problema. Vultr tem $6/mês com IP brasileiro estável.
-
-**Acesso:** SSH como `root` (precisa criar usuário `deploy` e desabilitar root depois — pendente).
-
-### 1.2 Docker
-
-**O que é:** runtime de containers.
-
-**Por que usamos:** o **FlareSolverr** roda como container Docker pré-empacotado. Sem Docker teria que rodar Chrome headless + dependências do sistema na unha. Docker isola tudo.
-
-**Estado:** `docker run -d --name flaresolverr -p 127.0.0.1:8191:8191 ghcr.io/flaresolverr/flaresolverr:latest`
-
-Note o **bind em 127.0.0.1** — o FlareSolverr **não** pode estar exposto na internet (qualquer um o usaria pra contornar Cloudflare). Só localhost.
-
-### 1.3 FlareSolverr
-
-**O que é:** servidor que sobe um Chrome headless e resolve Cloudflare challenges. Recebe uma URL via HTTP POST, retorna `cf_clearance` válido + `userAgent` que ele usou.
-
-**Por que crítico:** o `cf_clearance` é vinculado ao par **(IP, User-Agent, possivelmente JA3)**. Como o IP da VPS muda em relação ao seu PC, o `cf_clearance` que você tem no navegador local não vale na VPS. O FlareSolverr resolve um challenge **a partir do IP da VPS**, gerando um clearance válido pra ela.
-
-**Endpoint usado:** `POST http://127.0.0.1:8191/v1` com body `{ cmd: "request.get", url: "https://gamersclub.com.br" }`.
-
-### 1.4 PM2
-
-**O que é:** process manager pra Node.js — mantém o app rodando, reinicia em crash, gerencia logs.
-
-**Por que:** sem PM2 o `node src/index.js` morre se a sessão SSH cair, ou se o processo crashear. PM2 daemoniza.
-
-**Comandos principais:**
-```bash
-pm2 start src/index.js --name amigos-cs2
-pm2 logs amigos-cs2          # streaming de logs
-pm2 restart amigos-cs2
-pm2 status
-pm2 flush amigos-cs2         # limpa logs antigos
-pm2 startup && pm2 save      # auto-start no boot da VPS
-```
-
-### 1.5 Nginx
-
-**O que é:** reverse proxy / web server.
-
-**Por que:** o Express tá em 127.0.0.1:3000 (porta interna). Quem recebe HTTPS na porta 443 e encaminha pro Express é o Nginx. Vantagens:
-- Termina TLS (só ele lida com certificado)
-- Adiciona headers (`X-Forwarded-For`, `X-Real-IP`)
-- Permite múltiplos serviços no mesmo IP no futuro (ex: api1.duckdns.org, api2.duckdns.org)
-
-**Config:** `/etc/nginx/sites-available/amigos-cs2` — server block que escuta `:443 ssl` e faz `proxy_pass http://127.0.0.1:3000;`.
-
-### 1.6 Certbot + ZeroSSL (DNS-01 via DuckDNS)
-
-**O que é:** Certbot é o cliente; ZeroSSL é a CA (Certificate Authority) que emite o certificado TLS. Originalmente o plano era usar Let's Encrypt, mas LE estava em manutenção quando emitimos, e ZeroSSL HTTP-01 estava bugado — fechamos com **ZeroSSL via desafio DNS-01**.
-
-**Por que HTTPS:** o frontend é HTTPS (Firebase Hosting), então o backend tem que ser HTTPS também (browsers bloqueiam mixed content).
-
-**Por que DNS-01 e não HTTP-01:** ZeroSSL não conseguia validar HTTP-01 (challenge ficava em "processing" infinitamente). DNS-01 cria um TXT record em `_acme-challenge.amigos-cs2.duckdns.org` via API do DuckDNS, ZeroSSL consulta esse DNS pra validar.
-
-**Plugin necessário:** `certbot-dns-duckdns` (instalado com `pip3 install certbot-dns-duckdns --break-system-packages`).
-
-**Credenciais:** `/root/.duckdns-credentials` (modo 600), uma linha: `dns_duckdns_token = <token>`.
-
-**Renovação:** automática via `systemd timer` (`certbot.timer`). Cert dura 90 dias, renova quando faltam 30. A config de renewal em `/etc/letsencrypt/renewal/amigos-cs2.duckdns.org.conf` já guarda que tem que usar ZeroSSL+DNS-01.
-
-**Confere com:**
-```bash
-systemctl list-timers | grep certbot
-certbot certificates
-certbot renew --dry-run    # simulação completa de renovação (recomendado rodar uma vez)
-```
-
-**Se ZeroSSL um dia também der pau** e Let's Encrypt já estiver de volta, basta editar o renewal config (`/etc/letsencrypt/renewal/amigos-cs2.duckdns.org.conf`) e remover as linhas `server = https://acme.zerossl.com/...`, `eab_kid`, `eab_hmac_key`. Aí roda `certbot renew --force-renewal` que migra pra LE.
-
-### 1.7 DuckDNS
-
-**O que é:** serviço que dá subdomínios gratuitos no formato `<seunome>.duckdns.org`, com DNS dinâmico.
-
-**Por que usamos:** Let's Encrypt **não emite cert pra IP**, só pra domínio. Como você não tinha domínio próprio, DuckDNS dá um subdomínio grátis que aponta pro IP da VPS — e Let's Encrypt aceita.
-
-**Config:** painel web em https://www.duckdns.org/. O IP é fixo (Vultr), então não precisa de cron de update — basta apontar `amigos-cs2.duckdns.org` → IP da VPS uma vez.
-
-### 1.8 UFW (firewall) — pendente
-
-**Estado atual:** Vultr não tem firewall ativo por padrão; UFW também não foi configurado.
-
-**A configurar:**
-```bash
-ufw default deny incoming
-ufw default allow outgoing
-ufw allow 22         # SSH
-ufw allow 80         # HTTP (Certbot precisa)
-ufw allow 443        # HTTPS
-ufw enable
-```
-
-A porta 8191 (FlareSolverr) **não** é aberta porque o bind é em 127.0.0.1. A porta 3000 (Express) também fica interna — só o Nginx fala com ela.
+**Tratamento de erro** (`routes/proxy.js`):
+- **429 / 5xx do GC** → se houver versão em cache (mesmo "velha"), serve ela em
+  vez de propagar o erro (`x-proxy-cache: STALE`); senão devolve o status.
+- **200 sem JSON** (página de login/erro) → 503 "sessão inválida" (ou cache
+  stale, se houver).
+- **403** → só ocorre no caminho axios (dev local); tenta renovar o
+  `cf_clearance` e refazer uma vez.
 
 ---
 
-## Camada 2 — Aplicação Node.js
+## 3. Cache, serialização e deduplicação
 
-### 2.1 Estrutura
+Três mecanismos no proxy reduzem o volume de chamadas ao GC — o que evita o
+**rate-limit** (o GC devolve 429 e depois 500 quando o IP da VPS faz muitas
+requisições) e esconde a latência do Chrome do FlareSolverr.
+
+### 3.1 Cache em memória (`routes/proxy.js`)
+
+- `Map` simples: `path → { data, status, expiresAt }`.
+- Partida já buscada é servida do cache até expirar. Partida **finalizada não
+  muda**, então um TTL generoso é seguro.
+- Configurável pelo `.env`:
+  - `PROXY_CACHE_TTL` — validade em **segundos** (default **300** = 5 min).
+  - `PROXY_CACHE_MAX` — teto de entradas (default **500**); ao estourar, descarta
+    a mais antiga.
+- Em 429/5xx, serve a versão em cache mesmo expirada (melhor um dado velho que um
+  erro). Em todas as respostas há o header `x-proxy-cache: HIT | MISS | STALE`
+  (útil pra depurar no DevTools).
+- **Reiniciar o app zera o cache** (é em memória, não persiste).
+
+### 3.2 Serialização do FlareSolverr (`services/flaresolverr.js`)
+
+O FlareSolverr roda **um Chrome só** e atende **um pedido por vez**. Se duas
+chamadas chegam juntas (o cron de `cf_clearance` + uma request, ou o front
+pedindo vários matches), ele colide e devolve erro / página de desafio em vez do
+JSON. Por isso há uma **fila** (`serialize`) que garante uma chamada ao solver
+por vez.
+
+### 3.3 Deduplicação de pedidos idênticos (`routes/proxy.js`)
+
+Se N requisições do **mesmo** `path` chegam enquanto uma já está em voo, todas
+esperam a **mesma** busca (`fetchDeduped`) em vez de disparar N chamadas ao
+FlareSolverr.
+
+> **Trade-off:** como o FlareSolverr é serializado, abrir o front e pedir vários
+> matches **diferentes** de uma vez faz eles saírem **um a um** (alguns segundos
+> cada na 1ª vez). O cache faz isso acontecer só na primeira busca de cada
+> partida. Se um dia ficar lento demais, dá pra subir uma 2ª instância do
+> FlareSolverr.
+
+---
+
+## 4. Infraestrutura (VPS)
+
+### 4.1 Vultr Cloud Compute
+Servidor virtual com IP fixo (São Paulo, Ubuntu 24.04). Uma Cloud Function do
+Firebase (us-central1) levava 403 do Cloudflare porque o IP do GCP está em listas
+de bots; uma VPS brasileira passa. Acesso por SSH como `root`.
+
+### 4.2 Docker + FlareSolverr
+O FlareSolverr roda como container Docker. Ele sobe um Chrome headless, resolve
+challenges do Cloudflare e — no nosso uso — **faz a própria request à API do GC**
+(fingerprint de browser real). Devolve o conteúdo + o `userAgent` usado.
+
+```bash
+docker run -d --name flaresolverr -p 127.0.0.1:8191:8191 \
+  ghcr.io/flaresolverr/flaresolverr:latest
+```
+
+**Bind em `127.0.0.1`** — o FlareSolverr **não** pode ficar exposto na internet
+(qualquer um o usaria pra furar Cloudflare). Endpoint: `POST http://127.0.0.1:8191/v1`.
+
+### 4.3 PM2
+Process manager do Node: mantém o app vivo, reinicia em crash, gerencia logs.
+```bash
+pm2 start src/index.js --name amigos-cs2
+pm2 logs amigos-cs2            # streaming
+pm2 logs amigos-cs2 --lines 50 --nostream
+pm2 restart amigos-cs2
+pm2 status
+pm2 startup && pm2 save        # auto-start no boot da VPS
+```
+
+> ⚠️ **Atenção ao trocar cookies do `.env`:** o PM2 preserva o `process.env`
+> entre restarts. Veja [`RENOVAR-TOKENS.md`](./RENOVAR-TOKENS.md) — o código já usa
+> `dotenv ... { override: true }` pra contornar isso.
+
+### 4.4 Nginx
+Reverse proxy: termina TLS na `:443` e encaminha pro Express na `:3000`.
+Config em `/etc/nginx/sites-available/amigos-cs2`.
+```bash
+nginx -t && systemctl reload nginx
+```
+
+### 4.5 Certbot + ZeroSSL (DNS-01 via DuckDNS)
+Certificado TLS. Let's Encrypt não emite cert pra IP, só pra domínio — daí o
+DuckDNS. Na emissão, o Let's Encrypt estava em manutenção e o ZeroSSL HTTP-01
+travava, então fechamos com **ZeroSSL via DNS-01**:
+- Plugin `certbot-dns-duckdns` (`pip3 install certbot-dns-duckdns --break-system-packages`).
+- Credenciais DuckDNS em `/root/.duckdns-credentials` (modo 600).
+- Renovação automática via `systemd timer`; config em
+  `/etc/letsencrypt/renewal/amigos-cs2.duckdns.org.conf`.
+```bash
+certbot certificates
+certbot renew --dry-run
+```
+Se um dia o ZeroSSL falhar e o Let's Encrypt voltar, remova as linhas
+`server = https://acme.zerossl.com/...`, `eab_kid`, `eab_hmac_key` do renewal
+config e rode `certbot renew --force-renewal`.
+
+### 4.6 DuckDNS
+Subdomínio gratuito `amigos-cs2.duckdns.org` → IP fixo da VPS. Como o IP é fixo
+(Vultr), não precisa de cron de update.
+
+---
+
+## 5. Aplicação Node.js
+
+### 5.1 Estrutura
 
 ```
 backend/
+├── index.js                    # entrypoint legado (Firebase Functions) — não usado na VPS
 ├── src/
-│   ├── index.js                # entrypoint: bootstrap + PORT
+│   ├── index.js                # entrypoint da VPS: bootstrap + listen
 │   ├── app.js                  # Express app + middlewares + rotas
 │   ├── middlewares/
-│   │   └── cors.js             # CORS (libera o domínio do frontend)
+│   │   └── cors.js             # CORS — libera ALLOWED_ORIGIN
 │   ├── routes/
-│   │   ├── proxy.js            # /api/lobby/match/* → GC
+│   │   ├── proxy.js            # /api/lobby/match/* + cache + dedup
 │   │   └── session.js          # /api/session/{status,renew} (debug)
 │   └── services/
-│       ├── auth.js             # orquestra login (cookies + flaresolverr)
-│       ├── manualAuth.js       # injeta cookies do .env no jar
-│       ├── flaresolverr.js     # chama FlareSolverr e persiste cf_clearance
-│       ├── httpClient.js       # cliente axios + cookie jar + UA dinâmico
+│       ├── auth.js             # orquestra o boot da sessão
+│       ├── manualAuth.js       # injeta cookies do .env no cookie jar (dev/axios)
+│       ├── flaresolverr.js     # fetchJson (busca a API) + refreshClearance + fila
+│       ├── httpClient.js       # axios + cookie jar (fallback de dev local)
 │       ├── cookieJar.js        # tough-cookie jar compartilhado
-│       └── sessionManager.js   # cron de renovação do cf_clearance
-├── .env                        # cookies + FLARESOLVERR_URL etc
+│       └── sessionManager.js   # cron */25 de renovação do cf_clearance
+├── .env                        # cookies + configs (NÃO commitar)
 └── package.json
 ```
 
-### 2.2 Fluxo de boot
+### 5.2 Boot (`src/index.js`)
+1. `require('dotenv').config({ override: true })` — carrega o `.env` **sempre por
+   cima** do que estiver no `process.env` (ver §10 / `RENOVAR-TOKENS.md`).
+2. `auth.initialize()` injeta os cookies e, se `FLARESOLVERR_URL` estiver setado,
+   pede um `cf_clearance` inicial ao solver.
+3. `sessionManager.start()` agenda o cron `*/25` de renovação do `cf_clearance`.
+4. Express ouve na porta 3000.
 
-1. `index.js` carrega `.env`, chama `auth.initialize()`
-2. `auth.login()`:
-   - `manualAuth.loadManualSession()` injeta `gclubsess`, `gcid:accessToken`, `x-gcid:accessToken` no cookie jar (lendo do `.env`)
-   - Se `FLARESOLVERR_URL` estiver setado:
-     - `flaresolverr.refreshClearance()` chama o FlareSolverr → recebe `cf_clearance` + `userAgent`, persiste o clearance no jar
-     - `httpClient.setUserAgent(userAgent)` atualiza o UA usado pelo axios
-   - Marca a sessão como autenticada
-3. `sessionManager.start()` agenda cron a cada 25 min pra renovar o `cf_clearance`
-4. Express começa a ouvir na porta 3000
-
-### 2.3 Fluxo de uma request
-
-1. Frontend chama `https://amigos-cs2.duckdns.org/api/lobby/match/26866303/1`
-2. Nginx termina TLS, repassa pra `http://127.0.0.1:3000/api/lobby/match/26866303/1`
-3. Express → router em `proxy.js` faz `client.get('/lobby/match/26866303/1')`
-4. `httpClient` (axios) anexa via interceptor:
-   - `user-agent`: o UA do FlareSolverr (linha viva, atualizada por `setUserAgent`)
-   - Cookies do jar (`tough-cookie`): `gclubsess`, `gcid:accessToken`, `x-gcid:accessToken`, `cf_clearance`
-   - Headers fixos: `accept`, `accept-language`, `sec-fetch-*`, `referer`
-5. Resposta do GC volta como JSON, é encaminhada pro frontend
-
-### 2.4 Tratamento de 403
-
-`proxy.js` tem retry automático: se o GC retornar 403, ele chama `sessionManager.forceRenew()` (que pede um novo `cf_clearance` ao FlareSolverr) e tenta de novo uma vez. Se o segundo tiro falhar, devolve 403 ao cliente.
+> **Produção vs dev:** com `FLARESOLVERR_URL` setado (VPS), as buscas à API saem
+> pelo FlareSolverr (`fetchJson`). Sem ele (dev local), caem no axios + cookie jar
+> (`httpClient`), usando o `cf_clearance` do `.env` válido pro IP residencial.
 
 ---
 
-## Camada 3 — Bibliotecas (o que e por quê)
+## 6. Bibliotecas (o que e por quê)
 
-### 3.1 Dependências de runtime
-
-#### `express` (^5.2.1)
-Framework HTTP minimalista. Usado pra rotear `/api/lobby/...`, `/api/session/...`, `/health`. Escolhido por ser o padrão do ecossistema Node e ter overhead próximo de zero.
-
-#### `cors` (^2.8.6)
-Middleware que adiciona os headers CORS necessários pro browser deixar o frontend (`amigos-cs2-north-wind.web.app`) chamar a API. Sem isso, browser bloqueia chamadas cross-origin.
-
-#### `axios` (^1.16.0)
-Cliente HTTP. Usado pra falar com a API do GC e com o FlareSolverr. Por que axios em vez de `fetch` nativo:
-- Suporta cookie jar via plugin (essencial)
-- Interceptors (usamos pra injetar UA dinâmico)
-- API mais ergonômica pra request/response
-
-#### `tough-cookie` (^4.1.4) ⚠ versão 4 propositalmente
-Implementação do RFC 6265 (cookies HTTP). Usado pra **manter os cookies de sessão** entre requests.
-
-**Por que v4 e não v6:** v6 é ESM-only e o VPS roda Node 18, que não suporta `require(esm)`. v4 é CommonJS e funciona em qualquer Node.
-
-#### `axios-cookiejar-support` (^5.0.5) ⚠ versão 5 propositalmente
-Bridge entre `axios` e `tough-cookie`. Sem isso, axios não sabe ler/escrever do cookie jar.
-
-**Por que v5 e não v6:** mesmo motivo do tough-cookie — v6 é ESM-only.
-
-#### `dotenv` (^17.4.2)
-Carrega o arquivo `.env` em `process.env`. Usamos pra os cookies e configs (`FLARESOLVERR_URL`, `APP_PORT`, etc.) ficarem fora do código.
-
-#### `node-cron` (^4.2.1)
-Agenda tarefas em formato cron. Usamos pra rodar `flaresolverr.refreshClearance()` a cada 25 minutos (cf_clearance dura ~30 min).
-
-#### `firebase-admin` / `firebase-functions` (legado)
-Ficaram no `package.json` da época em que o backend rodava como Cloud Function. **Vão ser removidas** após o cutover (Fase 6 do MIGRACAO.md). Por enquanto não atrapalham porque não são `require`'d em runtime.
-
-### 3.2 Removidas durante a migração
-
-- **`puppeteer`** — usado antes pra fazer login automatizado por email/senha. Removido: o GC não aceita mais essa conta de email (forçou Steam OAuth).
-- **`docker`** (npm package) — era dep fantasma, nunca foi usado.
-
-### 3.3 Stack de infraestrutura
-
-#### Docker
-Roda o FlareSolverr containerizado. Sem Docker, teria que instalar Chrome + Xvfb + libs do sistema na mão.
-
-#### FlareSolverr
-Resolve Cloudflare challenges via Chrome headless. Devolve `cf_clearance` + `userAgent` válidos pro IP de quem o invocou (a VPS, no nosso caso).
-
-#### PM2
-Mantém o Node app vivo, reinicia em crash, persiste logs em `/root/.pm2/logs/`.
-
-#### Nginx
-Reverse proxy: termina TLS na :443, encaminha pro Express na :3000. Também é quem o Certbot ajusta automaticamente quando você roda `certbot --nginx`.
-
-#### Certbot + Let's Encrypt
-Cert TLS gratuito. Renovação automática via systemd timer.
-
-#### DuckDNS
-Subdomínio gratuito (`amigos-cs2.duckdns.org`). Necessário pra Let's Encrypt emitir cert (não emite pra IP).
-
----
-
-## Camada 4 — Rotacionar tokens / cookies
-
-Tem dois tipos de credenciais:
-
-| Credencial | Onde mora | Validade | Renovação |
-|---|---|---|---|
-| `gclubsess`, `gcid:accessToken`, `x-gcid:accessToken` | `.env` | ~6 meses | **Manual**, via navegador |
-| `cf_clearance` | gerado em runtime, em memória + cookie jar | ~30 min | **Automática** via cron do FlareSolverr |
-
-### 4.1 Renovar cookies de sessão (a cada ~6 meses)
-
-Quando você notar que o backend começou a retornar 401/403 mesmo com o `cf_clearance` válido, é sinal de que o `gclubsess` expirou.
-
-**Passo 1 — Pegar cookies novos do navegador:**
-
-1. Abre `https://gamersclub.com.br/` no Chrome e faz login (via Steam)
-2. Confirma que tá logado (vê seu perfil no canto)
-3. F12 → aba **Application** → **Cookies** → seleciona `https://gamersclub.com.br`
-4. Anota os valores **atuais** de:
-   - `gclubsess`
-   - `gcid:accessToken`
-   - `x-gcid:accessToken`
-
-**Passo 2 — Atualizar o `.env` da VPS:**
-
-```bash
-ssh root@<IP_DA_VPS>
-cd ~/amigos-cs2/amigos-cs2-v2/backend
-nano .env
-```
-
-Atualiza as três linhas:
-```
-GCLUBSESS=<valor novo>
-ACCESS_TOKEN=<valor novo do gcid:accessToken>
-X_ACCESS_TOKEN=<valor novo do x-gcid:accessToken>
-```
-
-**Passo 3 — Reiniciar o app:**
-
-```bash
-pm2 restart amigos-cs2
-pm2 logs amigos-cs2 --lines 20 --nostream
-```
-
-No log você quer ver:
-```
-[manual-auth] cookie "gclubsess" injetado
-[manual-auth] cookie "gcid:accessToken" injetado
-[manual-auth] cookie "x-gcid:accessToken" injetado
-[flaresolverr] cf_clearance persistido no jar
-[auth] sessão pronta (modo: manual+flaresolverr)
-[server] rodando na porta 3000
-```
-
-**Passo 4 — Validar:**
-
-```bash
-curl -s https://amigos-cs2.duckdns.org/health | jq
-curl -s https://amigos-cs2.duckdns.org/api/lobby/match/26866303/1 | head -c 200
-```
-
-A primeira tem que retornar `authenticated: true`. A segunda, JSON com dados da partida.
-
-### 4.2 cf_clearance (renovação automática)
-
-O `cf_clearance` é gerado pelo FlareSolverr e renovado **automaticamente a cada 25 minutos** (cron `*/25 * * * *` em `sessionManager.js`). Você não precisa fazer nada.
-
-**Forçar renovação manual** (debug, ou após reiniciar FlareSolverr):
-
-Localmente no VPS:
-```bash
-curl -X POST http://localhost:3000/api/session/renew
-```
-
-Em produção (com `INTERNAL_API_KEY` setado):
-```bash
-curl -X POST https://amigos-cs2.duckdns.org/api/session/renew \
-  -H "x-api-key: <valor de INTERNAL_API_KEY>"
-```
-
-**Reiniciar o FlareSolverr** (caso ele engasgue):
-```bash
-docker restart flaresolverr
-pm2 restart amigos-cs2   # opcional, pra forçar nova requisição
-```
-
-### 4.3 Troubleshooting de auth
-
-| Sintoma | Provável causa | Ação |
+| Lib | Versão | Para quê |
 |---|---|---|
-| `health` retorna `authenticated: false` no boot | Cookies do `.env` incorretos OU FlareSolverr inacessível | `pm2 logs amigos-cs2 --lines 30` — vai dizer qual dos dois |
-| 401 nas chamadas `/api/lobby/...` | `gclubsess` ou `accessToken` expirado | Rotacionar cookies (seção 4.1) |
-| 403 com `cf-mitigated: challenge` | `cf_clearance` desatualizado ou mismatch de UA | `curl -X POST localhost:3000/api/session/renew` |
-| `connect ECONNREFUSED ::1:8191` | FlareSolverr fora do ar OU `.env` usando `localhost` em vez de `127.0.0.1` | `docker restart flaresolverr` + checar `.env` |
+| `express` | ^5.x | Framework HTTP / roteamento. |
+| `cors` | ^2.8 | Headers CORS pra liberar o domínio do frontend. |
+| `axios` | ^1.x | Cliente HTTP — fala com o FlareSolverr e (em dev) com o GC. |
+| `tough-cookie` | **^4.1** | Cookie jar (RFC 6265). **v4 de propósito**: v6 é ESM-only e o Node 18 não faz `require(esm)`. |
+| `axios-cookiejar-support` | **^5.0** | Bridge axios ↔ tough-cookie. **v5 de propósito** (mesmo motivo). |
+| `dotenv` | ^17 | Carrega o `.env`. Usado com `{ override: true }`. |
+| `node-cron` | ^4 | Cron do `cf_clearance` (`*/25 * * * *`). |
+| `firebase-admin` / `firebase-functions` | — | **Legado** (era Cloud Function). Não são `require`'d na VPS; podem ser removidas. |
+
+**Removidas na migração:** `puppeteer` (login automatizado por email/senha — o GC
+forçou Steam OAuth) e o pacote `docker` (dep fantasma).
 
 ---
 
-## Operação no dia a dia
+## 7. Variáveis de ambiente (.env)
 
-### Comandos essenciais
+```env
+APP_PORT=3000
+ALLOWED_ORIGIN=https://amigos-cs2-north-wind.web.app   # SEM barra no final
+GAMERSCLUB_BASE_URL=https://gamersclub.com.br          # SEM barra no final
+
+# Cookies de sessão — copiados do Chrome DevTools (~6 meses). Ver RENOVAR-TOKENS.md
+GCLUBSESS=<valor de gclubsess>
+ACCESS_TOKEN=<valor de gcid:accessToken>               # token opaco
+X_ACCESS_TOKEN=<valor de x-gcid:accessToken>           # JWT (eyJ...), DIFERENTE do anterior
+
+# cf_clearance — só em dev local (válido pro IP residencial). Em produção, vazio.
+CF_CLEARANCE=
+
+# FlareSolverr — vazio em dev local; na VPS:
+FLARESOLVERR_URL=http://127.0.0.1:8191/v1              # 127.0.0.1, NÃO localhost (Node 18 → IPv6)
+
+# Cache do proxy (opcional)
+PROXY_CACHE_TTL=300                                     # segundos (default 300)
+PROXY_CACHE_MAX=500                                     # nº de entradas (default 500)
+
+INTERNAL_API_KEY=                                       # protege /api/session/* em produção
+CF_CRON=*/25 * * * *                                    # intervalo de renovação do cf_clearance
+```
+
+> `gcid:accessToken` e `x-gcid:accessToken` têm valores **diferentes**: o primeiro
+> é opaco, o segundo é um JWT (`eyJ...`). Não copie o mesmo nos dois.
+
+---
+
+## 8. Endpoints
+
+| Método / rota | Descrição |
+|---|---|
+| `GET /health` | Status do servidor e se a sessão está autenticada. |
+| `GET /api/lobby/match/:matchId/:tab` | Proxy pra `gamersclub.com.br/lobby/match/:matchId/:tab` (a API JSON). |
+| `GET /api/lobby/match/:matchId` | Proxy pra a página da partida (sem tab). |
+| `GET /api/session/status` | Detalhes da sessão (requer `INTERNAL_API_KEY` em prod). |
+| `POST /api/session/renew` | Força renovação do `cf_clearance` (requer `INTERNAL_API_KEY`). |
+
+`GET /health` esperado:
+```json
+{ "status": "ok", "session": { "authenticated": true, "loggedInAt": "..." } }
+```
+
+> ⚠️ `authenticated: true` só significa que os cookies foram **injetados** — não
+> garante que o GC os aceita (token pode estar expirado). A prova real é uma
+> chamada a `/api/lobby/match/...` retornar JSON.
+
+---
+
+## 9. Operação no dia a dia
 
 | Tarefa | Comando |
 |---|---|
 | Status do app | `pm2 status` |
-| Logs do app (streaming) | `pm2 logs amigos-cs2` |
-| Logs do app (últimas N linhas, sem stream) | `pm2 logs amigos-cs2 --lines 50 --nostream` |
-| Reiniciar o app | `pm2 restart amigos-cs2` |
-| Limpar logs antigos | `pm2 flush amigos-cs2` |
+| Logs (streaming) | `pm2 logs amigos-cs2` |
+| Logs (últimas N, sem stream) | `pm2 logs amigos-cs2 --lines 50 --nostream` |
+| Só erros | `pm2 logs amigos-cs2 --lines 50 --nostream --err` |
+| Reiniciar | `pm2 restart amigos-cs2` |
 | Logs do FlareSolverr | `docker logs -f flaresolverr` |
 | Reiniciar FlareSolverr | `docker restart flaresolverr` |
-| Status do Nginx | `systemctl status nginx` |
-| Recarregar Nginx (após editar config) | `nginx -t && systemctl reload nginx` |
-| Ver certificados TLS | `certbot certificates` |
-| Renovar cert (manual, normalmente é automático) | `certbot renew` |
+| Recarregar Nginx | `nginx -t && systemctl reload nginx` |
+| Ver certificados | `certbot certificates` |
 
-### Healthcheck rápido (uma linha)
-
+**Deploy de código novo:**
 ```bash
-curl -s https://amigos-cs2.duckdns.org/health | jq
+cd /root/amigos-cs2/amigos-cs2-backend/backend
+git pull
+pm2 restart amigos-cs2
 ```
 
-Saída esperada: `{ "status": "ok", "session": { "authenticated": true, "loggedInAt": "..." } }`
-
-### Quando algo der errado
-
-1. **Sempre comece pelos logs:** `pm2 logs amigos-cs2 --lines 50 --nostream`
-2. **Olhe a tabela de troubleshooting** na seção 4.3
-3. **Histórico de incidentes anteriores** está em [`MIGRACAO.md`](./MIGRACAO.md) (tabela de bugs encontrados durante a migração — bom ponto de referência se algo parecido voltar)
+**Healthcheck rápido:**
+```bash
+curl -s https://amigos-cs2.duckdns.org/health
+curl -si https://amigos-cs2.duckdns.org/api/lobby/match/27128374/1 | grep -iE "HTTP/|x-proxy-cache"
+curl -si https://amigos-cs2.duckdns.org/api/lobby/match/27128374/1 | grep -iE "HTTP/|x-proxy-cache"
+```
+Esperado: `200`, com a 1ª chamada `x-proxy-cache: MISS` e a 2ª `HIT`.
 
 ---
 
-*Documento gerado em 2026-05-08 durante a migração Firebase Functions → VPS Vultr SP.*
+## 10. Troubleshooting
+
+| Sintoma | Causa provável | Ação |
+|---|---|---|
+| 500 "Erro do Gamersclub" com `pm2 env` mostrando **token velho** | PM2 cacheou o token expirado no `process.env` | Ver [`RENOVAR-TOKENS.md`](./RENOVAR-TOKENS.md): `pm2 delete` + `pm2 start` (o código já tem `override:true`). |
+| 503 "Sessão inválida / não retornou JSON" | Cookies de sessão expirados, **ou** o GC devolveu HTML (rate-limit/erro) | Conferir token (RENOVAR-TOKENS.md). Se persistir, ver os 2 itens abaixo. |
+| 500/HTML com `NREUM`/New Relic no body | Chamada saiu com fingerprint de não-browser (**não** pelo FlareSolverr), **ou** rate-limit do IP | Confirmar que `FLARESOLVERR_URL` está setado (prod sempre usa FlareSolverr). Testar isolado pelo solver (ver abaixo). |
+| Muitos `429` no log, depois `500` | Volume de requisições alto demais pro IP | O cache (§3) reduz isso; aumentar `PROXY_CACHE_TTL`. |
+| `502 erro inesperado` intermitente | Colisão de chamadas concorrentes no FlareSolverr | Já mitigado pela fila (§3.2). Conferir `docker logs flaresolverr`. |
+| `connect ECONNREFUSED ::1:8191` | `.env` usa `localhost` em vez de `127.0.0.1` | `FLARESOLVERR_URL=http://127.0.0.1:8191/v1` |
+| `ERR_REQUIRE_ESM` no boot | Versão errada de `tough-cookie`/`axios-cookiejar-support` (v6 é ESM) | Manter `tough-cookie@^4` e `axios-cookiejar-support@^5`. |
+| "erro de CORS" no browser (mas curl 200) | `ALLOWED_ORIGIN` errado/ausente, ou com `/` no final | `.env`: `ALLOWED_ORIGIN=https://amigos-cs2-north-wind.web.app` (sem barra) + `pm2 restart`. |
+
+**Teste isolado do FlareSolverr** (confirma se o IP/sessão estão OK, fora do app):
+```bash
+cd /root/amigos-cs2/amigos-cs2-backend/backend
+node -e "require('dotenv').config({override:true});const a=require('axios');const u=process.env.GAMERSCLUB_BASE_URL+'/lobby/match/27128374/1';a.post(process.env.FLARESOLVERR_URL,{cmd:'request.get',url:u,maxTimeout:60000,cookies:[{name:'gclubsess',value:process.env.GCLUBSESS},{name:'gcid:accessToken',value:process.env.ACCESS_TOKEN},{name:'x-gcid:accessToken',value:process.env.X_ACCESS_TOKEN||process.env.ACCESS_TOKEN}]},{timeout:120000}).then(r=>console.log('origem:',r.data.solution.status,(r.data.solution.response||'').slice(0,120))).catch(e=>console.error(e.message))"
+```
+Se isso retornar `origem: 200` + `<pre>{...}`, o IP/sessão estão bons e o
+problema é no app (env do PM2, cache, etc.).
+
+---
+
+## 11. Pendências
+
+Itens de hardening que ainda não foram feitos (baixa prioridade):
+
+- **UFW (firewall)** — não está ativo:
+  ```bash
+  ufw default deny incoming && ufw default allow outgoing
+  ufw allow 22 && ufw allow 80 && ufw allow 443
+  ufw enable
+  ```
+  (8191 e 3000 não são abertas — ficam internas.)
+- **PM2 startup** — garantir auto-start no boot: `pm2 startup && pm2 save`.
+- **Usuário não-root** — hoje tudo roda como `root`; criar usuário `deploy` e
+  desabilitar root no SSH.
+- **Remover deps legadas** — `npm uninstall firebase-admin firebase-functions`.
+- **Node 18 → 22** — se atualizar, dá pra voltar `tough-cookie` e
+  `axios-cookiejar-support` pras versões 6.
+- **2ª instância do FlareSolverr** — se a serialização (§3.3) ficar lenta na prática.
