@@ -42,6 +42,17 @@ async function fetchUpstream(path, headers) {
   return { status: response.status, data: response.data, isHtml: contentType.includes('text/html') };
 }
 
+// Coalesce: se N pedidos do mesmo path chegam enquanto um já está em voo,
+// todos esperam a mesma busca em vez de disparar N chamadas ao FlareSolverr.
+const inflight = new Map(); // path -> Promise<{status,data,isHtml}>
+function fetchDeduped(path, headers) {
+  const existing = inflight.get(path);
+  if (existing) return existing;
+  const p = fetchUpstream(path, headers).finally(() => inflight.delete(path));
+  inflight.set(path, p);
+  return p;
+}
+
 async function proxyGet(path, res, { referer } = {}) {
   const headers = referer ? { referer: `${GC_URL()}${referer}` } : {};
   const cached = readCache(path);
@@ -54,7 +65,7 @@ async function proxyGet(path, res, { referer } = {}) {
 
   let result;
   try {
-    result = await fetchUpstream(path, headers);
+    result = await fetchDeduped(path, headers);
 
     // 403 só acontece no caminho axios (cf_clearance/UA). Renova e tenta 1x.
     if (result.status === 403 && !USE_FLARE()) {

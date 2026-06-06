@@ -23,17 +23,30 @@ async function persistCfClearance(cookies = []) {
   await jar.setCookie(tc, GC_URL());
 }
 
-async function callSolver(url, cookies) {
-  const solver = FLARE_URL();
-  if (!solver) throw new Error('FLARESOLVERR_URL não configurado');
+// O FlareSolverr roda um Chrome só e atende um pedido por vez. Se duas chamadas
+// chegam juntas (cron + request, ou o front pollando vários matches), ele colide
+// e devolve erro/página de desafio em vez do JSON. Esta fila serializa TODAS as
+// chamadas ao solver — uma de cada vez.
+let solverQueue = Promise.resolve();
+function serialize(task) {
+  const run = solverQueue.then(task, task);
+  solverQueue = run.then(() => {}, () => {}); // mantém a fila andando mesmo em erro
+  return run;
+}
 
-  const body = { cmd: 'request.get', url, maxTimeout: 60000 };
-  if (cookies) body.cookies = cookies;
-  const resp = await axios.post(solver, body, { timeout: 120000 });
-  if (resp.data?.status !== 'ok') {
-    throw new Error(`FlareSolverr retornou status="${resp.data?.status}" — ${resp.data?.message || 'sem detalhes'}`);
-  }
-  return resp.data.solution;
+function callSolver(url, cookies) {
+  return serialize(async () => {
+    const solver = FLARE_URL();
+    if (!solver) throw new Error('FLARESOLVERR_URL não configurado');
+
+    const body = { cmd: 'request.get', url, maxTimeout: 60000 };
+    if (cookies) body.cookies = cookies;
+    const resp = await axios.post(solver, body, { timeout: 120000 });
+    if (resp.data?.status !== 'ok') {
+      throw new Error(`FlareSolverr retornou status="${resp.data?.status}" — ${resp.data?.message || 'sem detalhes'}`);
+    }
+    return resp.data.solution;
+  });
 }
 
 // O Chrome do FlareSolverr renderiza JSON dentro de <pre>...</pre> e escapa as
@@ -68,6 +81,10 @@ async function fetchJson(url) {
 
   const solution = await callSolver(url, cookies);
   const data = extractJson(solution.response);
+  if (data === null) {
+    const preview = (solution.response || '').replace(/\s+/g, ' ').slice(0, 300);
+    console.error(`[flaresolverr] resposta sem JSON para ${url} (status ${solution.status}): ${preview}`);
+  }
   return { status: solution.status || 0, data, isJson: data !== null };
 }
 
