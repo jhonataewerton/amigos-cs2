@@ -23,16 +23,52 @@ async function persistCfClearance(cookies = []) {
   await jar.setCookie(tc, GC_URL());
 }
 
-async function callSolver(url) {
+async function callSolver(url, cookies) {
   const solver = FLARE_URL();
   if (!solver) throw new Error('FLARESOLVERR_URL não configurado');
 
   const body = { cmd: 'request.get', url, maxTimeout: 60000 };
+  if (cookies) body.cookies = cookies;
   const resp = await axios.post(solver, body, { timeout: 120000 });
   if (resp.data?.status !== 'ok') {
     throw new Error(`FlareSolverr retornou status="${resp.data?.status}" — ${resp.data?.message || 'sem detalhes'}`);
   }
   return resp.data.solution;
+}
+
+// O Chrome do FlareSolverr renderiza JSON dentro de <pre>...</pre> e escapa as
+// entidades HTML. Extrai e parseia. Retorna null se não for JSON (ex.: página
+// de erro 500 do GC ou landing de sessão inválida).
+function extractJson(html) {
+  if (!html) return null;
+  const m = html.match(/<pre[^>]*>([\s\S]*?)<\/pre>/i);
+  const text = (m ? m[1] : html.trim())
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&');
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+// Busca uma URL JSON da API do GC pelo Chrome real do FlareSolverr.
+// Fingerprint de browser + cf_clearance consistente → evita o 500 que o GC
+// devolve quando a chamada sai do axios/Node. Injeta os cookies de sessão.
+// Retorna { status, data, isJson } — status é o HTTP real da origem.
+async function fetchJson(url) {
+  const cookies = [
+    { name: 'gclubsess', value: process.env.GCLUBSESS },
+    { name: 'gcid:accessToken', value: process.env.ACCESS_TOKEN },
+    { name: 'x-gcid:accessToken', value: process.env.X_ACCESS_TOKEN || process.env.ACCESS_TOKEN },
+  ].filter((c) => c.value);
+
+  const solution = await callSolver(url, cookies);
+  const data = extractJson(solution.response);
+  return { status: solution.status || 0, data, isJson: data !== null };
 }
 
 // Pede ao FlareSolverr um cf_clearance válido para o IP atual.
@@ -46,4 +82,4 @@ async function refreshClearance() {
   return { userAgent: solution.userAgent };
 }
 
-module.exports = { refreshClearance };
+module.exports = { refreshClearance, fetchJson };
