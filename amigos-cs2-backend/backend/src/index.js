@@ -1,4 +1,7 @@
-require('dotenv').config();
+// override: true garante que os valores do .env sempre vençam o que o PM2
+// possa ter cacheado no process.env entre restarts (senão um token velho
+// carregado num start anterior nunca seria atualizado).
+require('dotenv').config({ override: true });
 
 const app = require('./app');
 const { initialize } = require('./services/auth');
